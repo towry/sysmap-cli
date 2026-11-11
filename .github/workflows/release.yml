@@ -1,0 +1,69 @@
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: towry/sysmap
+          ref: main
+          token: ${{ secrets.GH_DOWNLOAD_PAT }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+
+      - name: Verify source
+        working-directory: source
+        run: |
+          grep -Fq 'REPO="${SYSMAP_REPO:-towry/sysmap-cli}"' install.sh
+          SYSMAP_RELEASE_TAG="$(git describe --tags --abbrev=0)" go test -count=1 ./...
+          go vet ./...
+
+      - name: Build release assets
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean
+          workdir: source
+
+      - name: Publish latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source_sha="$(git -C source rev-parse --short HEAD)"
+          notes="Built from towry/sysmap main at ${source_sha}."
+          assets=(
+            source/dist/sysmap_linux_amd64.tar.gz
+            source/dist/sysmap_linux_arm64.tar.gz
+            source/dist/sysmap_darwin_amd64.tar.gz
+            source/dist/sysmap_darwin_arm64.tar.gz
+            source/dist/checksums.txt
+            source/install.sh
+          )
+          for asset in "${assets[@]}"; do
+            test -f "${asset}"
+          done
+          for archive in "${assets[@]:0:4}"; do
+            test "$(tar -tzf "${archive}")" = sysmap
+          done
+
+          if gh release view latest --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload latest --repo "${GITHUB_REPOSITORY}" "${assets[@]}" --clobber
+            gh release edit latest --repo "${GITHUB_REPOSITORY}" --latest --title "Latest main build" --notes "${notes}"
+          else
+            gh release create latest --repo "${GITHUB_REPOSITORY}" --latest --title "Latest main build" --notes "${notes}" "${assets[@]}"
+          fi
