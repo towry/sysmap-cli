@@ -2,14 +2,40 @@ name: release
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-hex source commit already merged into main
+        required: true
+        type: string
+      release_tag:
+        description: New stable vMAJOR.MINOR.PATCH tag
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      PUBLIC_WORKFLOW_SHA: ${{ github.sha }}
     steps:
+      - name: Validate stable release inputs
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
@@ -20,50 +46,139 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Select exact merged source and local build tag
+        working-directory: source
+        run: |
+          if ! (
+            git cat-file -e "${SOURCE_SHA}^{commit}" &&
+            git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main &&
+            git checkout --detach "$SOURCE_SHA" &&
+            test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          ) >"$RUNNER_TEMP/source-selection.log" 2>&1; then
+            echo 'Source must be an exact commit already contained in main.'
+            exit 1
+          fi
+          # This tag exists only on the build runner; no source credentials persist.
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
+          else
+            git tag "$RELEASE_TAG"
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: source/go.mod
+          cache: false
 
       - name: Verify source
         working-directory: source
         run: |
-          grep -Fq 'REPO="${SYSMAP_REPO:-towry/sysmap-cli}"' install.sh
-          SYSMAP_RELEASE_TAG="$(git describe --tags --abbrev=0)" go test -count=1 ./...
-          go vet ./...
+          if ! (
+            grep -Fq 'REPO="${SYSMAP_REPO:-towry/sysmap-cli}"' install.sh &&
+            SYSMAP_RELEASE_TAG="$RELEASE_TAG" go test -count=1 ./... &&
+            go vet ./...
+          ) >"$RUNNER_TEMP/source-verification.log" 2>&1; then
+            echo 'Source verification failed; no release was created.'
+            exit 1
+          fi
 
-      - name: Build release assets
+      - name: Install GoReleaser v2
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --snapshot --clean
-          workdir: source
+          install-only: true
 
-      - name: Publish latest release
+      - name: Build and verify stable assets
+        working-directory: source
+        run: |
+          if ! GORELEASER_CURRENT_TAG="$RELEASE_TAG" goreleaser release --clean --skip=publish \
+            >"$RUNNER_TEMP/stable-build.log" 2>&1; then
+            echo 'Stable packaging failed; no release was created.'
+            exit 1
+          fi
+          export STAGING="$RUNNER_TEMP/stable-assets"
+          mkdir "$STAGING"
+          archives=(sysmap_linux_amd64.tar.gz sysmap_linux_arm64.tar.gz sysmap_darwin_amd64.tar.gz sysmap_darwin_arm64.tar.gz)
+          for archive in "${archives[@]}"; do
+            test "$(tar -tzf "dist/$archive")" = sysmap
+            cp "dist/$archive" "$STAGING/$archive"
+          done
+          mkdir "$RUNNER_TEMP/version-check"
+          tar -xzf "$STAGING/sysmap_linux_amd64.tar.gz" -C "$RUNNER_TEMP/version-check"
+          test "$("$RUNNER_TEMP/version-check/sysmap" version)" = "$RELEASE_TAG"
+          cp install.sh "$STAGING/install.sh"
+          python3 - <<'PY'
+          import json, os, pathlib
+          manifest = {
+              'release_tag': os.environ['RELEASE_TAG'],
+              'source_sha': os.environ['SOURCE_SHA'],
+              'public_workflow_sha': os.environ['PUBLIC_WORKFLOW_SHA'],
+              'format': 3,
+              'schema': 1,
+          }
+          (pathlib.Path(os.environ['STAGING']) / 'release-manifest.json').write_text(
+              json.dumps(manifest, indent=2) + '\n')
+          PY
+          cd "$STAGING"
+          sha256sum "${archives[@]}" install.sh release-manifest.json > checksums.txt
+          sha256sum --check checksums.txt
+
+      - name: Publish immutable stable release as latest
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          source_sha="$(git -C source rev-parse --short HEAD)"
-          notes="Built from towry/sysmap main at ${source_sha}."
-          assets=(
-            source/dist/sysmap_linux_amd64.tar.gz
-            source/dist/sysmap_linux_arm64.tar.gz
-            source/dist/sysmap_darwin_amd64.tar.gz
-            source/dist/sysmap_darwin_arm64.tar.gz
-            source/dist/checksums.txt
-            source/install.sh
-          )
-          for asset in "${assets[@]}"; do
-            test -f "${asset}"
-          done
-          for archive in "${assets[@]:0:4}"; do
-            test "$(tar -tzf "${archive}")" = sysmap
-          done
-
-          if gh release view latest --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload latest --repo "${GITHUB_REPOSITORY}" "${assets[@]}" --clobber
-            gh release edit latest --repo "${GITHUB_REPOSITORY}" --latest --title "Latest main build" --notes "${notes}"
-          else
-            gh release create latest --repo "${GITHUB_REPOSITORY}" --latest --title "Latest main build" --notes "${notes}" "${assets[@]}"
-          fi
+          # Check both Git tags and all authenticated-visible releases, including drafts.
+          python3 - <<'PY'
+          import json, os, re, urllib.request, urllib.error
+          repo, tag = os.environ['GITHUB_REPOSITORY'], os.environ['RELEASE_TAG']
+          def get(endpoint):
+              return urllib.request.urlopen(urllib.request.Request(f'https://api.github.com/repos/{repo}/{endpoint}',
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'}))
+          try:
+              get(f'git/ref/tags/{tag}').close()
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          else:
+              raise SystemExit('Tag/release already exists; inspect before choosing a new version.')
+          target = tuple(map(int, tag[1:].split('.')))
+          page = 1
+          while True:
+              with get(f'releases?per_page=100&page={page}') as response:
+                  releases = json.load(response)
+              for release in releases:
+                  if release['tag_name'] == tag:
+                      raise SystemExit('Tag/release already exists, including drafts; inspect before retrying.')
+                  match = re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', release['tag_name'])
+                  if match and not release['draft'] and not release['prerelease']:
+                      if tuple(map(int, match.groups())) >= target:
+                          raise SystemExit('Stable release must be newer than existing stable versions.')
+              if len(releases) < 100:
+                  break
+              page += 1
+          PY
+          cd "$RUNNER_TEMP/stable-assets"
+          assets=(sysmap_linux_amd64.tar.gz sysmap_linux_arm64.tar.gz sysmap_darwin_amd64.tar.gz sysmap_darwin_arm64.tar.gz install.sh release-manifest.json checksums.txt)
+          sha256sum --check checksums.txt
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$PUBLIC_WORKFLOW_SHA" --draft --latest=false \
+            --title "$RELEASE_TAG" --notes 'Stable release. See release-manifest.json for build identity.' \
+            "${assets[@]}"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets > "$RUNNER_TEMP/public-release.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          release = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'public-release.json').read_text())
+          expected = {'sysmap_' + system + '_' + arch + '.tar.gz'
+                      for system in ('linux', 'darwin') for arch in ('amd64', 'arm64')}
+          expected |= {'install.sh', 'release-manifest.json', 'checksums.txt'}
+          assert release['isDraft'] and not release['isPrerelease']
+          assert len(release['assets']) == len(expected)
+          assert {asset['name'] for asset in release['assets']} == expected
+          assert all(asset['state'] == 'uploaded' and asset['size'] > 0 for asset in release['assets'])
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease=false --latest
