@@ -1,10 +1,23 @@
 # sysmap-cli
 
-Install the latest build:
+Install the latest stable release:
 
 ```sh
 curl -fsSL https://github.com/towry/sysmap-cli/releases/latest/download/install.sh | bash
 ```
+
+The default download selects the latest published stable version, not a snapshot
+or an opt-in prerelease. Stable releases have immutable `vMAJOR.MINOR.PATCH`
+tags and an exact matching CLI version. `release-manifest.json` records the
+private source commit and public workflow commit; `checksums.txt` covers all six
+payload files, including the installer and manifest.
+
+Maintainers: run the manual `release` workflow with a full 40-hex `source_sha`
+already merged into source `main` and a new stable `release_tag`. It creates a
+local source tag only on the build runner, builds without snapshot mode, verifies
+the binary version, and publishes a new stable release as GitHub's latest. Never
+overwrite a published version. A failed partial release must be inspected before
+another publication attempt.
 
 ## Isolated prereleases
 
