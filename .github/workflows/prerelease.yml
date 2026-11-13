@@ -1,0 +1,201 @@
+name: prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-hex source commit already merged into main
+        required: true
+        type: string
+      release_tag:
+        description: Unique v0.3.0-ul.N tag (N is a positive integer)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prerelease-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      PUBLIC_WORKFLOW_SHA: ${{ github.sha }}
+      SYSMAP_RELEASE_TAG: v0.3.0
+    steps:
+      - name: Validate immutable inputs
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'Invalid source_sha'; exit 1; }
+          [[ "$RELEASE_TAG" =~ ^v0\.3\.0-ul\.[1-9][0-9]*$ ]] || { echo 'Invalid release_tag'; exit 1; }
+          [[ "$PUBLIC_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout private main without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          repository: towry/sysmap
+          ref: main
+          token: ${{ secrets.GH_DOWNLOAD_PAT }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select exact merged source
+        run: |
+          # Do not print private commit messages, filenames, or diagnostics.
+          if ! (
+            cd source &&
+            git cat-file -e "${SOURCE_SHA}^{commit}" &&
+            git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main &&
+            git checkout --detach "$SOURCE_SHA" &&
+            test "$(git rev-parse HEAD)" = "${SOURCE_SHA,,}"
+          ) >"$RUNNER_TEMP/source-selection.log" 2>&1; then
+            echo 'Source must be an exact commit already contained in main.'
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Verify selected source
+        working-directory: source
+        run: |
+          # Keep private test diagnostics runner-local, including on failure.
+          if ! (
+            grep -Fq 'REPO="${SYSMAP_REPO:-towry/sysmap-cli}"' install.sh &&
+            test -z "$(gofmt -l .)" &&
+            go vet ./... &&
+            go test -count=1 -race ./... &&
+            go build -o "$RUNNER_TEMP/sysmap-check" . &&
+            "$RUNNER_TEMP/sysmap-check" check --refs examples/shop.smap &&
+            "$RUNNER_TEMP/sysmap-check" check --refs system.smap &&
+            node --test internal/smap/viewer_test.mjs
+          ) >"$RUNNER_TEMP/source-verification.log" 2>&1; then
+            echo 'Selected-source verification failed; no release was created.'
+            exit 1
+          fi
+
+      - name: Install GoReleaser v2
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          install-only: true
+
+      - name: Build and stage only approved assets
+        working-directory: source
+        run: |
+          export SYSMAP_PRERELEASE_VERSION="${RELEASE_TAG#v}"
+          export STAGING="$RUNNER_TEMP/prerelease-assets"
+          export SNAPSHOT_CONFIG="$RUNNER_TEMP/prerelease-goreleaser.yaml"
+          # Parse YAML, rather than matching indentation, before adding a key.
+          # Ruby/Psych is supplied by the GitHub ubuntu-latest runner.
+          if ! ruby -ryaml -e '
+            config = YAML.load_file(".goreleaser.yaml")
+            abort "Existing snapshot configuration" if config.key?("snapshot")
+            abort "GoReleaser v2 required" unless config["version"] == 2
+            File.write(ENV.fetch("SNAPSHOT_CONFIG"), File.read(".goreleaser.yaml") +
+              "\nsnapshot:\n  version_template: \u0027{{ .Env.SYSMAP_PRERELEASE_VERSION }}\u0027\n")
+          ' >"$RUNNER_TEMP/config-validation.log" 2>&1; then
+            echo 'Source packaging config requires a reviewed snapshot adapter.'
+            exit 1
+          fi
+          if ! goreleaser release --config "$SNAPSHOT_CONFIG" --snapshot --clean \
+            >"$RUNNER_TEMP/snapshot-build.log" 2>&1; then
+            echo 'Snapshot packaging failed; no release was created.'
+            exit 1
+          fi
+          mkdir "$STAGING"
+          archives=(sysmap_linux_amd64.tar.gz sysmap_linux_arm64.tar.gz sysmap_darwin_amd64.tar.gz sysmap_darwin_arm64.tar.gz)
+          for archive in "${archives[@]}"; do
+            test -f "dist/$archive"
+            test "$(tar -tzf "dist/$archive")" = sysmap
+            cp "dist/$archive" "$STAGING/$archive"
+          done
+          mkdir "$RUNNER_TEMP/version-check"
+          tar -xzf "$STAGING/sysmap_linux_amd64.tar.gz" -C "$RUNNER_TEMP/version-check"
+          test "$("$RUNNER_TEMP/version-check/sysmap" --version)" = "$RELEASE_TAG"
+          cp install.sh "$STAGING/install.sh"
+          export GO_TOOL_VERSION="$(go env GOVERSION)"
+          export NODE_TOOL_VERSION="$(node --version)"
+          export GORELEASER_TOOL_VERSION="$(goreleaser --version)"
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          # Store version identifiers only, never tool banners or build paths.
+          goreleaser = re.search(r'\b(v?2\.\d+\.\d+)\b', os.environ['GORELEASER_TOOL_VERSION'])
+          if not goreleaser:
+              raise SystemExit('Cannot identify GoReleaser v2')
+          manifest = {
+              'release_tag': os.environ['RELEASE_TAG'],
+              'source_sha': os.environ['SOURCE_SHA'].lower(),
+              'public_workflow_sha': os.environ['PUBLIC_WORKFLOW_SHA'],
+              'tool_versions': {
+                  'go': os.environ['GO_TOOL_VERSION'],
+                  'node': os.environ['NODE_TOOL_VERSION'],
+                  'goreleaser': goreleaser.group(1),
+              },
+              'format': 3,
+              'schema': 1,
+          }
+          (pathlib.Path(os.environ['STAGING']) / 'release-manifest.json').write_text(
+              json.dumps(manifest, indent=2) + '\n')
+          PY
+          cd "$STAGING"
+          sha256sum "${archives[@]}" install.sh release-manifest.json > checksums.txt
+          sha256sum --check checksums.txt
+
+      - name: Create a new public prerelease (never overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Check both namespaces; only an authenticated 404 means absent.
+          node --input-type=module <<'JS'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const tag = encodeURIComponent(process.env.RELEASE_TAG);
+          for (const endpoint of [`git/ref/tags/${tag}`, `releases/tags/${tag}`]) {
+            const response = await fetch(`https://api.github.com/repos/${repo}/${endpoint}`, {
+              headers: {Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json'},
+            });
+            if (response.status !== 404) {
+              throw new Error('Tag/release already exists, or absence could not be verified. Use a new N after inspection.');
+            }
+          }
+          JS
+          cd "$RUNNER_TEMP/prerelease-assets"
+          assets=(sysmap_linux_amd64.tar.gz sysmap_linux_arm64.tar.gz sysmap_darwin_amd64.tar.gz sysmap_darwin_arm64.tar.gz install.sh release-manifest.json checksums.txt)
+          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq "${#assets[@]}"
+          for asset in "${assets[@]}"; do test -f "$asset" && test ! -L "$asset"; done
+          sha256sum --check checksums.txt
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$PUBLIC_WORKFLOW_SHA" --draft --prerelease --latest=false \
+            --title "$RELEASE_TAG" --notes 'Isolated prerelease. See release-manifest.json for build identity.' \
+            "${assets[@]}"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets > "$RUNNER_TEMP/public-release.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          release = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'public-release.json').read_text())
+          expected = {'sysmap_' + os + '_' + arch + '.tar.gz' for os in ('linux', 'darwin') for arch in ('amd64', 'arm64')}
+          expected |= {'install.sh', 'release-manifest.json', 'checksums.txt'}
+          assert release['isDraft'] and release['isPrerelease']
+          assert len(release['assets']) == len(expected)
+          assert {a['name'] for a in release['assets']} == expected
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease --latest=false
